@@ -42,3 +42,13 @@ build/
 
 # Frontend static files — not tracked in git
 static/
+
+# Node / Next.js — NEVER commit these
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+node_modules/
+.next/
+
+# Python scratch files
+copy_img.py

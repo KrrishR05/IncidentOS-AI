@@ -30,8 +30,6 @@ _check_env()
 import asyncio
 
 from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 
 from schemas import (
@@ -40,6 +38,8 @@ from schemas import (
     ResolveIncidentRequest,
     ResolveIncidentResponse,
     SimilarIncident,
+    PostmortemResponse,
+    InsightsResponse,
 )
 import memory
 import agent
@@ -67,12 +67,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
-@app.get("/")
-def read_root():
-    return FileResponse("static/index.html")
 
 
 @app.post("/incident/new", response_model=NewIncidentResponse)
@@ -230,3 +225,39 @@ def get_incident(incident_id: str):
                 "resolved_at":     rec.get("resolved_at"),
             }
     raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found.")
+
+
+@app.post("/incident/{incident_id}/postmortem", response_model=PostmortemResponse)
+def generate_postmortem(incident_id: str):
+    """Generate a markdown post-mortem for a resolved incident."""
+    records = memory.get_all_incidents()
+    incident = next((r for r in records if r["incident_id"] == incident_id), None)
+    
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found.")
+        
+    if not incident.get("root_cause"):
+        raise HTTPException(status_code=400, detail="Cannot generate postmortem for an unresolved incident.")
+        
+    markdown = agent.generate_postmortem(
+        title=incident["title"],
+        description=incident.get("description") or "",
+        root_cause=incident["root_cause"],
+        mitigation=incident.get("mitigation_steps") or "Unknown"
+    )
+    
+    return PostmortemResponse(incident_id=incident_id, markdown=markdown)
+
+
+@app.get("/incidents/insights", response_model=InsightsResponse)
+def get_insights():
+    """Analyze recent resolved incidents to provide systemic insights."""
+    records = memory.get_all_incidents()
+    resolved = [r for r in records if r.get("root_cause")]
+    
+    if not resolved:
+        return InsightsResponse(insights=[])
+        
+    insights = agent.generate_insights(resolved)
+    return InsightsResponse(insights=insights)
+

@@ -91,3 +91,52 @@ Example format:
 "Check pg_stat_activity WHERE state='idle in transaction' AND duration > 30s", \
 "Alert resolved when p99 latency drops below 500ms for 5 consecutive minutes"]
 """
+
+# ── Postmortem Generator ─────────────────────────────────────────────────────
+POSTMORTEM_PROMPT = """\
+You are an expert SRE and Technical Writer. Generate a professional, markdown-formatted \
+incident post-mortem for the following resolved incident.
+
+INCIDENT TITLE: {title}
+DESCRIPTION: {description}
+ACTUAL ROOT CAUSE: {root_cause}
+ACTUAL MITIGATION: {mitigation}
+
+Output exactly the following sections in valid Markdown:
+# Incident Post-Mortem: {title}
+
+## Executive Summary
+<2-3 sentences summarizing the impact, root cause, and resolution.>
+
+## Timeline
+<Generate a realistic, bulleted timeline of events based on the incident. Include detection, investigation, mitigation, and resolution times.>
+
+## The "5 Whys" Root Cause Analysis
+<Generate 5 cascading "Why?" questions and answers leading to the root cause.>
+
+## Action Items
+<Generate 3-5 concrete action items to prevent recurrence, including the team responsible and priority.>
+"""
+
+# ── Systemic Reflection (Insights) ───────────────────────────────────────────
+INSIGHTS_PROMPT = """\
+You are a Staff SRE analyzing the past month of incidents to find systemic patterns, \
+vulnerabilities, and strategic recommendations for the engineering organization.
+
+PAST RESOLVED INCIDENTS (Batch):
+{incidents_batch}
+
+Analyze these incidents and identify exactly 4 systemic insights or recurring themes.
+Return ONLY a valid JSON array of objects. No other text.
+
+Format exactly like this:
+[
+  {{
+    "type": "Performance Bottleneck",
+    "title": "Database Connection Pool Exhaustion",
+    "body": "30% of recent incidents involved Postgres connection limits being hit during traffic spikes.",
+    "action": "Implement PgBouncer globally and scale connection limits."
+  }},
+  ...
+]
+"""

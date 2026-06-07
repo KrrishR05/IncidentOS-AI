@@ -24,6 +24,21 @@ class SimilarIncident(BaseModel):
     created_at: str
 
 
+class PostmortemResponse(BaseModel):
+    incident_id: str
+    markdown: str
+
+
+class Insight(BaseModel):
+    type: str
+    title: str
+    body: str
+    action: str
+
+class InsightsResponse(BaseModel):
+    insights: List[Insight]
+
+
 class NewIncidentResponse(BaseModel):
     incident_id: str
     title: str

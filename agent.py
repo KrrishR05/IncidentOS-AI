@@ -17,6 +17,8 @@ from prompts import (
     INCIDENT_ANALYSIS_PROMPT,
     INCIDENT_ANALYSIS_WITH_MEMORY_PROMPT,
     SUGGESTED_ACTIONS_PROMPT,
+    POSTMORTEM_PROMPT,
+    INSIGHTS_PROMPT,
 )
 
 load_dotenv()
@@ -160,3 +162,48 @@ def suggest_actions(
     # Fallback: split by newline
     lines = [line.strip("•- ").strip() for line in raw.split("\n") if line.strip()]
     return lines[:4]
+
+
+def generate_postmortem(
+    title: str,
+    description: str,
+    root_cause: str,
+    mitigation: str,
+) -> str:
+    """Generate a Markdown postmortem report for a resolved incident."""
+    prompt = POSTMORTEM_PROMPT.format(
+        title=title,
+        description=description,
+        root_cause=root_cause,
+        mitigation=mitigation,
+    )
+    # Using higher max_tokens for a full report and slightly higher temperature for creativity
+    return _call_groq(prompt, temperature=0.4, max_tokens=1000)
+
+
+def generate_insights(resolved_incidents: List[dict]) -> List[dict]:
+    """Generate 4 systemic insights based on a batch of resolved incidents."""
+    # We limit to the top 30 to avoid context length limits and high latency
+    batch = resolved_incidents[:30]
+    
+    parts = []
+    for inc in batch:
+        parts.append(f"Title: {inc['title']}\nRoot Cause: {inc['root_cause']}\nMitigation: {inc['mitigation_steps']}")
+        
+    incidents_batch = "\n---\n".join(parts)
+    
+    prompt = INSIGHTS_PROMPT.format(incidents_batch=incidents_batch)
+    raw = _call_groq(prompt, temperature=0.3, max_tokens=800)
+    
+    # Parse JSON array
+    try:
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        data = json.loads(raw[start:end])
+        if isinstance(data, list):
+            return data[:4]
+    except (ValueError, json.JSONDecodeError):
+        logger.warning("Could not parse Groq insights JSON.")
+        
+    return []
+

@@ -14,8 +14,8 @@ Usage:
 import argparse
 import json
 import os
+import re as _re
 import sys
-import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -267,40 +267,118 @@ def _fetch_via_recall_sweep(client) -> list:
 
 # ── Record parsers ────────────────────────────────────────────────────────────
 
+
 def _parse_item(item) -> dict | None:
-    """
-    Converts either a dict (REST) or object (SDK) memory item into IncidentOS format.
+    """Convert a Hindsight memory item (dict or SDK object) into IncidentOS format.
+
+    TWO item types arrive:
+      A) recall() result  — SDK RecallResult object with .metadata dict containing our fields
+      B) list_memories()  — plain dict with NLP-extracted fact, NO metadata field
+
+    For (A): read incident_id from metadata dict.
+    For (B): regex-extract the incident_id from the fact text:
+        - "Incident ID d56b2cad: ..."
+        - "Incident d56b2cad ..."
+
+    CRITICAL: Items with no identifiable incident_id are SKIPPED (return None).
+    Never generate a random UUID — that creates 2000+ duplicate records on every sync.
     """
     if isinstance(item, dict):
-        meta       = item.get("metadata") or {}
-        text       = item.get("text") or item.get("content") or ""
-        occurred   = item.get("occurred_start") or item.get("created_at") or item.get("mentionedAt")
+        meta     = item.get("metadata") or {}
+        text     = item.get("text") or item.get("content") or ""
+        occurred = (item.get("occurred_start") or item.get("date")
+                    or item.get("mentioned_at") or item.get("created_at"))
     else:
-        meta       = getattr(item, "metadata", None) or {}
-        text       = getattr(item, "text", "") or ""
-        occurred   = getattr(item, "occurred_start", None)
+        meta     = getattr(item, "metadata", None) or {}
+        text     = getattr(item, "text", "") or ""
+        occurred = getattr(item, "occurred_start", None)
 
-    inc_id     = (meta.get("incident_id") or "").strip() if isinstance(meta, dict) else ""
-    title      = (meta.get("title") or "").strip() if isinstance(meta, dict) else ""
-    root_cause = (meta.get("root_cause") or "").strip() if isinstance(meta, dict) else ""
-    mitigation = (meta.get("mitigation_steps") or "").strip() if isinstance(meta, dict) else ""
+    meta = meta if isinstance(meta, dict) else {}
 
-    if not title:
-        title = (text.split(".")[0].strip())[:60]
-    if not title or len(title) < 5:
+    # ── A: metadata path (recall() results carry our stored metadata) ─────────
+    inc_id     = (meta.get("incident_id") or "").strip()
+    title      = (meta.get("title") or "").strip()
+    root_cause = (meta.get("root_cause") or "").strip()
+    mitigation = (meta.get("mitigation_steps") or "").strip()
+
+    # ── B: text-extraction path (list_memories() NLP fact items) ─────────────
+    if not inc_id and text:
+        # Pattern 1: 8-char hex IDs — "Incident ID d56b2cad" or "Incident d56b2cad"
+        id_match = _re.search(
+            r'[Ii]ncident\s+(?:ID\s+)?([0-9a-f]{8})(?:[^0-9a-f]|$)',
+            text,
+        )
+        if id_match:
+            inc_id = id_match.group(1)
+
+        # Pattern 2: INCxxxxxxx IDs — "Incident INC0027946 occurred..."
+        if not inc_id:
+            inc_match = _re.search(
+                r'[Ii]ncident\s+(INC\d+)',
+                text,
+            )
+            if inc_match:
+                inc_id = inc_match.group(1)
+
+        # Try to detect root_cause from resolution fact text
+        if not root_cause and inc_id:
+            rc_match = _re.search(
+                r'(?:root cause(?:\s+(?:of|was identified as))?[^.]*?|caused by)\s+'
+                r'([A-Za-z][A-Za-z0-9 _,\-]{2,80}?)'
+                r'(?:\s+and resolved|\s*\.|$)',
+                text, _re.I,
+            )
+            if rc_match:
+                root_cause = rc_match.group(1).strip()
+
+        # Try to detect mitigation from resolution fact text
+        if not mitigation and inc_id:
+            mit_match = _re.search(
+                r'resolved using(?:\s+mitigation(?:\s+step)?)?\s+'
+                r'([A-Za-z][A-Za-z0-9 _,\-]{2,120}?)(?:\.|$)',
+                text, _re.I,
+            )
+            if mit_match:
+                mitigation = mit_match.group(1).strip()
+
+    # ── CRITICAL: skip items with no identifiable incident_id ─────────────────
+    # DO NOT fall back to uuid.uuid4() — that creates a new garbage record for
+    # every NLP fact Hindsight extracted, causing ~2000 duplicates per sync run.
+    if not inc_id:
         return None
+
+    # ── Build title ───────────────────────────────────────────────────────────
+    if not title and text:
+        tm = _re.match(r'[Ii]ncident\s+(?:ID\s+)?[0-9a-f]+[:\s]+(.+?)(?:\.|$)', text)
+        if tm:
+            title = tm.group(1).strip()[:80]
+    if not title:
+        title = text.split(".")[0].strip()[:80]
+    if not title or len(title) < 3:
+        return None
+
+    # ── Extract description ───────────────────────────────────────────────────
+    description = ""
+    desc_match = _re.search(
+        r'[Dd]escription:\s*(.+?)(?:\s*\.\s*(?:Root cause:|Mitigation|Status:|$))',
+        text, _re.DOTALL,
+    )
+    if desc_match:
+        description = desc_match.group(1).strip().rstrip(".")
+    if not description:
+        description = text[:300]
 
     created_at = str(occurred) if occurred else datetime.now(timezone.utc).isoformat()
 
     return {
-        "incident_id":     inc_id or str(uuid.uuid4())[:8],
-        "title":           title,
-        "description":     text[:300],
-        "root_cause":      root_cause or None,
+        "incident_id":      inc_id,
+        "title":            title,
+        "description":      description[:500],
+        "root_cause":       root_cause or None,
         "mitigation_steps": mitigation or None,
-        "embedding":       [],
-        "created_at":      created_at,
-        "resolved_at":     created_at if root_cause else None,
+        "embedding":        [],
+        "created_at":       created_at,
+        "resolved_at":      created_at if root_cause else None,
         "hindsight_synced": True,
     }
 

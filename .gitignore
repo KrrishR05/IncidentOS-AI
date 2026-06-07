@@ -39,3 +39,6 @@ uvicorn.log
 dist/
 build/
 *.egg-info/
+
+# Frontend static files — not tracked in git
+static/

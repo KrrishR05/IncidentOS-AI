@@ -1,8 +1,5 @@
 """
 IncidentOS API — main FastAPI application.
-
-Startup validates that required environment variables are present so the
-server fails immediately with a clear message rather than crashing mid-request.
 """
 
 import logging
@@ -30,7 +27,11 @@ def _check_env() -> None:
 _check_env()
 # ─────────────────────────────────────────────────────────────────────────────
 
+import asyncio
+
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 
 from schemas import (
@@ -49,12 +50,13 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Sync all unsynced local incidents to Hindsight on startup (in thread pool)."""
-    import asyncio
-    loop = asyncio.get_event_loop()
-    # Run the sync SDK calls in a thread so they can create their own event loop
-    count = await loop.run_in_executor(None, memory.bulk_sync_to_hindsight)
-    logger.info("[Startup] Hindsight bulk-sync pushed %d records.", count)
+    """On startup: sync from Hindsight Cloud to populate local memory."""
+    loop    = asyncio.get_event_loop()
+    summary = await loop.run_in_executor(None, memory.sync_from_hindsight_cloud)
+    logger.info(
+        "[Startup] Hindsight cloud sync: fetched=%d added=%d updated=%d total=%d",
+        summary["fetched"], summary["added"], summary["updated"], summary["total"],
+    )
     yield
 
 
@@ -65,30 +67,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 @app.get("/")
 def read_root():
-    return {
-        "message": "IncidentOS API is running ✅",
-        "version": "0.2.0",
-        "model": agent.MODEL,
-    }
+    return FileResponse("static/index.html")
 
 
 @app.post("/incident/new", response_model=NewIncidentResponse)
 def create_incident(req: NewIncidentRequest):
+    """Create (or retrieve existing) incident, run AI analysis, and return full context.
+
+    This endpoint is idempotent: submitting the same title+description twice
+    returns the existing incident ID instead of creating a duplicate.
     """
-    Create a new incident. Automatically:
-    1. Deduplicates — if exact title+description already exists, returns existing record.
-    2. Stores it in vector memory (JSON-backed, survives restarts).
-    3. Searches for similar past incidents (resolved ones ranked first).
-    4. Calls the LLM to analyse (with memory context).
-    5. Suggests 4 immediate actions.
-    """
-    # 1. Store in memory (dedup handled inside)
     incident_id = memory.store_incident(req.title, req.description)
 
-    # 2. Find similar past incidents (exclude the current one)
     similar_raw = memory.find_similar_incidents(
         req.title, req.description, top_k=3, exclude_id=incident_id
     )
@@ -97,7 +92,7 @@ def create_incident(req: NewIncidentRequest):
         SimilarIncident(
             incident_id=rec["incident_id"],
             title=rec["title"],
-            description=rec["description"],
+            description=rec.get("description") or "",
             root_cause=rec.get("root_cause"),
             mitigation_steps=rec.get("mitigation_steps"),
             similarity_score=round(score, 4),
@@ -107,13 +102,9 @@ def create_incident(req: NewIncidentRequest):
     ]
 
     similar_dicts = [rec for rec, _ in similar_raw]
-
-    # 3. LLM analysis (errors surface as clean HTTP 502/500)
     analysis = agent.analyze_incident(
         req.title, req.description, similar_incidents=similar_dicts or None
     )
-
-    # 4. Suggested actions
     actions = agent.suggest_actions(
         req.title, req.description, analysis, similar_incidents=similar_dicts or None
     )
@@ -132,10 +123,10 @@ def create_incident(req: NewIncidentRequest):
 
 @app.post("/incident/resolve", response_model=ResolveIncidentResponse)
 def resolve_incident(req: ResolveIncidentRequest):
-    """
-    Resolve an existing incident.
-    Updates root_cause and mitigation_steps on the existing record in memory —
-    no new record is created. Future similar incidents will learn from this.
+    """Resolve an existing incident.
+
+    Updates root_cause and mitigation_steps on the local record and re-pushes
+    the resolved content to Hindsight Cloud (best-effort).
     """
     success = memory.resolve_incident(
         req.incident_id, req.root_cause, req.mitigation_steps
@@ -145,7 +136,6 @@ def resolve_incident(req: ResolveIncidentRequest):
             status_code=404,
             detail=f"Incident '{req.incident_id}' not found in memory.",
         )
-
     return ResolveIncidentResponse(
         incident_id=req.incident_id,
         status="resolved",
@@ -156,28 +146,87 @@ def resolve_incident(req: ResolveIncidentRequest):
     )
 
 
-@app.get("/incidents/all")
-def list_all_incidents():
-    """
-    Return all incidents in local memory with counts.
-    Used for health-checks and demo validation.
-    """
-    records = memory._load_memory()
-    resolved   = [r for r in records if r.get("root_cause")]
-    unresolved = [r for r in records if not r.get("root_cause")]
+@app.get("/status")
+def health_check():
+    """Health-check endpoint — used by the frontend to show backend/Hindsight status."""
+    hindsight_connected = memory._get_hindsight() is not None
     return {
-        "total":      len(records),
-        "resolved":   len(resolved),
-        "open":       len(unresolved),
-        "incidents":  [
+        "status": "online",
+        "version": "0.2.0",
+        "hindsight": hindsight_connected,
+    }
+
+
+@app.post("/sync")
+async def trigger_sync():
+    """Trigger a full sync from Hindsight Cloud into local memory on demand."""
+    loop    = asyncio.get_event_loop()
+    summary = await loop.run_in_executor(None, memory.sync_from_hindsight_cloud)
+    return {
+        "ok":      True,
+        "fetched": summary["fetched"],
+        "added":   summary["added"],
+        "updated": summary["updated"],
+        "total":   summary["total"],
+    }
+
+
+@app.post("/deduplicate")
+async def deduplicate():
+    """Remove duplicate incidents from local memory (exact-ID + semantic title dedup)."""
+    loop    = asyncio.get_event_loop()
+    summary = await loop.run_in_executor(None, memory.deduplicate_local_incidents)
+    return {
+        "ok":      True,
+        "before":  summary["before"],
+        "after":   summary["after"],
+        "removed": summary["removed"],
+    }
+
+
+# Endpoint to provide incident statistics and full list for the frontend
+@app.get("/incidents/all")
+def get_all_incidents():
+    """Return all local incidents with computed open/resolved stats."""
+    records   = memory.get_all_incidents()
+    resolved  = [r for r in records if r.get("root_cause")]
+    unresolved = [r for r in records if not r.get("root_cause")]
+
+    return {
+        "total":    len(records),
+        "resolved": len(resolved),
+        "open":     len(unresolved),
+        "incidents": [
             {
                 "incident_id":     r["incident_id"],
                 "title":           r["title"],
+                "description":     r.get("description") or "",
                 "status":          "resolved" if r.get("root_cause") else "open",
                 "root_cause":      r.get("root_cause"),
                 "mitigation_steps": r.get("mitigation_steps"),
                 "created_at":      r["created_at"],
+                "resolved_at":     r.get("resolved_at"),
             }
             for r in records
         ],
     }
+
+
+# Endpoint to get a single incident by ID
+@app.get("/incident/{incident_id}")
+def get_incident(incident_id: str):
+    """Return a single incident record by ID."""
+    records = memory.get_all_incidents()
+    for rec in records:
+        if rec["incident_id"] == incident_id:
+            return {
+                "incident_id":     rec["incident_id"],
+                "title":           rec["title"],
+                "description":     rec.get("description") or "",
+                "status":          "resolved" if rec.get("root_cause") else "open",
+                "root_cause":      rec.get("root_cause"),
+                "mitigation_steps": rec.get("mitigation_steps"),
+                "created_at":      rec["created_at"],
+                "resolved_at":     rec.get("resolved_at"),
+            }
+    raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found.")

@@ -1,6 +1,6 @@
 # IncidentOS AI 🚨
 
-An AI-powered incident management system that learns from every resolved incident.
+An AI-powered memory driven incident management system that learns from every resolved incident.
 Built with **FastAPI**, **Groq (llama-3.3-70b-versatile)**, **Hindsight Cloud memory**, and **sentence-transformers**.
 
 ---
